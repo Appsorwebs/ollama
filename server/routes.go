@@ -1526,6 +1526,13 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		defer close(ch)
 		var sb strings.Builder
 		var toolCallIndex int = 0
+		var sentWithTools int = 0
+		var prefix string
+		var specialToken string
+		var minDuration time.Duration = math.MaxInt64
+		var maxDuration time.Duration
+		var totalDuration time.Duration
+		var checkCount int
 		if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
 			Prompt:  prompt,
 			Images:  images,
@@ -1546,6 +1553,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			}
 
 			if r.Done {
+				slog.Debug("min duration", "duration", minDuration)
+				slog.Debug("max duration", "duration", maxDuration)
+				slog.Debug("total duration", "duration", totalDuration)
+				slog.Debug("check count", "count", checkCount)
+				// slog.Debug("average duration", "duration", totalDuration/time.Duration(checkCount))
 				res.DoneReason = r.DoneReason.String()
 				res.TotalDuration = time.Since(checkpointStart)
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
@@ -1563,25 +1575,43 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			// If tools are recognized, use a flag to track the sending of a tool downstream
 			// This ensures that content is cleared from the message on the last chunk sent
 			sb.WriteString(r.Content)
-			if toolCalls, ok := m.parseToolCalls(sb.String()); ok {
+			// TODO: here we want to prefix check the tool ideally or derive the tool token from the model
+			// TODO: if we are deriving the tool token, then a heuristic must be applied to stream eventually
+			// TODO: if the prefix check fails, send the content downstream and reset the builder
+			startTime := time.Now()
+			toolCalls, partial, ok := m.ParseToolCallsStreamNew(sb.String(), &prefix, &specialToken)
+			duration := time.Since(startTime)
+			checkCount++
+			minDuration = min(minDuration, duration)
+			maxDuration = max(maxDuration, duration)
+			totalDuration += duration
+			slog.Debug("tool call duration", "duration", duration)
+			if ok {
+				fmt.Println("toolCalls", toolCalls, partial, ok, duration)
+				if partial {
+					// If the tool call is partial, we need to wait for the next chunk
+					return
+				}
 				res.Message.ToolCalls = toolCalls
 				for i := range toolCalls {
 					toolCalls[i].Function.Index = toolCallIndex
 					toolCallIndex++
 				}
+				prefix = ""
+				specialToken = ""
 				res.Message.Content = ""
 				sb.Reset()
 				ch <- res
 				return
 			}
 
-			if r.Done {
-				// Send any remaining content if no tool calls were detected
-				if toolCallIndex == 0 {
-					res.Message.Content = sb.String()
-				}
-				ch <- res
-			}
+			// Send any remaining content if no tool calls were detected
+			// if toolCallIndex == 0 {
+			// fmt.Println("toolCallIndex", toolCallIndex)
+			sentWithTools++
+			res.Message.Content = sb.String()
+			sb.Reset()
+			ch <- res
 		}); err != nil {
 			ch <- gin.H{"error": err.Error()}
 		}
@@ -1590,11 +1620,26 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	if req.Stream != nil && !*req.Stream {
 		var resp api.ChatResponse
 		var sb strings.Builder
+		var toolCalls []api.ToolCall
+		var prefix string
+		var specialToken string
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.ChatResponse:
 				sb.WriteString(t.Message.Content)
 				resp = t
+				if len(req.Tools) > 0 {
+					if tcs, partial, ok := m.ParseToolCallsStreamNew(sb.String(), &prefix, &specialToken); ok {
+						if !partial {
+							// resp.Message.ToolCalls = toolCalls
+							toolCalls = append(toolCalls, tcs...)
+							resp.Message.Content = ""
+							sb.Reset()
+							prefix = ""
+							specialToken = ""
+						}
+					}
+				}
 			case gin.H:
 				msg, ok := t["error"].(string)
 				if !ok {
@@ -1610,13 +1655,19 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 
 		resp.Message.Content = sb.String()
-
-		if len(req.Tools) > 0 {
-			if toolCalls, ok := m.parseToolCalls(sb.String()); ok {
-				resp.Message.ToolCalls = toolCalls
-				resp.Message.Content = ""
-			}
+		if len(toolCalls) > 0 {
+			resp.Message.ToolCalls = toolCalls
+			resp.Message.Content = ""
 		}
+
+		// if len(req.Tools) > 0 {
+		// 	var prefix string
+		// 	var specialToken string
+		// 	if toolCalls, _, ok := m.ParseToolCallsStreamNew(sb.String(), &prefix, &specialToken); ok {
+		// 		resp.Message.ToolCalls = toolCalls
+		// 		resp.Message.Content = ""
+		// 	}
+		// }
 
 		c.JSON(http.StatusOK, resp)
 		return
