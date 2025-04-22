@@ -178,11 +178,6 @@ type VisionModel struct {
 
 // Forward computes the vision model for an input tensor
 func (m *VisionModel) Forward(ctx ml.Context, pixelValues ml.Tensor, grid *Grid) ml.Tensor {
-	// Calculate position IDs for 2D RoPE
-	numPatchesH := pixelValues.Dim(0) / m.patchSize
-	numPatchesW := pixelValues.Dim(1) / m.patchSize
-	numPatches := numPatchesH * numPatchesW
-
 	// Extract patch embeddings
 	hiddenStates := m.PatchEmbedding.Forward(
 		ctx,
@@ -192,32 +187,16 @@ func (m *VisionModel) Forward(ctx ml.Context, pixelValues ml.Tensor, grid *Grid)
 		m.patchSize,   // patch size, e.g., 14
 	)
 
-	// Create position IDs - for Qwen2VL mRoPE we need 4 values per position
-	positions := make([]int32, numPatches*4)
+	// spatialMergeSize := 2 // TODO: get this from config
+	// // Create the position IDs tensor with correct dimensions
+	// positions := []int32{}
 
-	for h := 0; h < numPatchesH; h++ {
-		for w := 0; w < numPatchesW; w++ {
-			idx := h*numPatchesW + w
-			// For each position, store both h and w coordinates twice
-			positions[idx*4] = int32(h)   // y coordinate
-			positions[idx*4+1] = int32(w) // x coordinate
-			positions[idx*4+2] = int32(h) // y coordinate (repeated)
-			positions[idx*4+3] = int32(w) // x coordinate (repeated)
-		}
-	}
+	// // Apply encoder layers
+	// for _, layer := range m.Layers {
+	// 	hiddenStates = layer.Forward(ctx, hiddenStates, positionIDs, m.VisionModelOptions)
+	// }
 
-	// Create the position IDs tensor with correct dimensions
-	positionIDs, err := ctx.Input().FromIntSlice(positions, numPatches*4)
-	if err != nil {
-		panic(err)
-	}
-
-	// Apply encoder layers
-	for _, layer := range m.Layers {
-		hiddenStates = layer.Forward(ctx, hiddenStates, positionIDs, m.VisionModelOptions)
-	}
-
-	hiddenStates = m.PostLayerNorm.Forward(ctx, hiddenStates, m.eps)
+	// hiddenStates = m.PostLayerNorm.Forward(ctx, hiddenStates, m.eps)
 	return hiddenStates
 }
 
